@@ -2,6 +2,7 @@ package com.newrelic.demo.relipeople.frontend.servlet;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.newrelic.api.agent.NewRelic;
 import jakarta.servlet.ServletException;
 import jakarta.servlet.annotation.WebServlet;
 import jakarta.servlet.http.HttpServlet;
@@ -15,12 +16,14 @@ import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.util.Timeout;
 
 import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
 @WebServlet(urlPatterns = {"/reports/payroll", "/reports/departments", "/reports/performance",
-        "/reports/leave-backlog", "/reports/salary-progression"})
+        "/reports/leave-backlog", "/reports/salary-progression", "/reports/employee-detail-audit"})
 public class ReportServlet extends HttpServlet {
 
     private static final String BACKEND_URL = System.getenv().getOrDefault("BACKEND_URL", "http://backend:8080");
@@ -66,6 +69,20 @@ public class ReportServlet extends HttpServlet {
                 endpoint = "/api/reports/salary-progression";
                 attrName = "salaryProgressionData";
                 jspPath = "/jsp/salary-progression-report.jsp";
+                break;
+            case "/reports/employee-detail-audit":
+                String strategy = request.getParameter("strategy");
+                if (!"eager".equals(strategy)) {
+                    strategy = "nplus1";
+                }
+                NewRelic.addCustomParameter("employeeAudit.strategy", strategy);
+                NewRelic.addCustomParameter("employeeAudit.limit", 75);
+                NewRelic.addCustomParameter("employeeAudit.eagerLoaded", "eager".equals(strategy));
+                endpoint = "/api/reports/employee-detail-audit?limit=75&strategy="
+                        + URLEncoder.encode(strategy, StandardCharsets.UTF_8);
+                attrName = "employeeAuditData";
+                jspPath = "/jsp/employee-detail-audit-report.jsp";
+                request.setAttribute("strategy", strategy);
                 break;
             default:
                 response.sendError(HttpServletResponse.SC_NOT_FOUND);

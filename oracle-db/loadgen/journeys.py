@@ -17,6 +17,7 @@ moves on so the user thread stays alive.
 from __future__ import annotations
 
 import logging
+import os
 import random
 import time
 from typing import List, Tuple
@@ -33,6 +34,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 logger = logging.getLogger(__name__)
+
+EMPLOYEE_AUDIT_STRATEGY = os.getenv("LOADGEN_EMPLOYEE_AUDIT_STRATEGY", "eager").strip().lower()
+if EMPLOYEE_AUDIT_STRATEGY not in ("nplus1", "eager"):
+    logger.warning(
+        "Invalid LOADGEN_EMPLOYEE_AUDIT_STRATEGY=%s; using eager",
+        EMPLOYEE_AUDIT_STRATEGY,
+    )
+    EMPLOYEE_AUDIT_STRATEGY = "eager"
 
 # Journey weights (must sum to 100)
 JOURNEY_WEIGHTS: List[Tuple[str, int]] = [
@@ -54,6 +63,7 @@ REPORT_PATHS = [
     "/reports/performance",
     "/reports/leave-backlog",
     "/reports/salary-progression",
+    f"/reports/employee-detail-audit?strategy={EMPLOYEE_AUDIT_STRATEGY}",
 ]
 
 DEFAULT_WAIT_S = 15

@@ -167,6 +167,7 @@
         <a href="/reports/performance" data-testid="report-performance">Performance</a>
         <a href="/reports/leave-backlog" data-testid="report-leave-backlog">Leave Backlog</a>
         <a href="/reports/salary-progression" data-testid="report-salary-progression">Salary Progression</a>
+        <a href="/reports/employee-detail-audit" data-testid="report-employee-audit">Employee Audit</a>
         <a href="/leaves" data-testid="nav-leaves">Leaves</a>
     </nav>
 </header>

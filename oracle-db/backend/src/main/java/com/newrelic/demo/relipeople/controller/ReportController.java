@@ -1,5 +1,6 @@
 package com.newrelic.demo.relipeople.controller;
 
+import com.newrelic.api.agent.NewRelic;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.JdbcTemplate;
@@ -9,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -99,6 +101,136 @@ public class ReportController {
         return ResponseEntity.ok(rows);
     }
 
+    @GetMapping("/employee-detail-audit")
+    public ResponseEntity<List<Map<String, Object>>> employeeDetailAudit(
+            @RequestParam(name = "limit", required = false, defaultValue = "75") int limit,
+            @RequestParam(name = "strategy", required = false, defaultValue = "nplus1") String strategy) {
+        int boundedLimit = Math.max(1, Math.min(limit, 200));
+        String selectedStrategy = strategy == null ? "nplus1" : strategy.trim().toLowerCase();
+        if (!"eager".equals(selectedStrategy)) {
+            selectedStrategy = "nplus1";
+        }
+
+        NewRelic.addCustomParameter("employeeAudit.strategy", selectedStrategy);
+        NewRelic.addCustomParameter("employeeAudit.limit", boundedLimit);
+        NewRelic.addCustomParameter("employeeAudit.eagerLoaded", "eager".equals(selectedStrategy));
+
+        if ("eager".equals(selectedStrategy)) {
+            return ResponseEntity.ok(employeeDetailAuditEager(boundedLimit));
+        }
+
+        return ResponseEntity.ok(employeeDetailAuditNPlusOne(boundedLimit));
+    }
+
+    private List<Map<String, Object>> employeeDetailAuditNPlusOne(int boundedLimit) {
+        String employeeSql = "SELECT e.emp_id AS \"empId\", "
+                + "       e.first_name || ' ' || e.last_name AS \"fullName\", "
+                + "       d.dept_name AS \"deptName\", "
+                + "       jg.job_title AS \"jobTitle\" "
+                + "FROM EMPLOYEES e "
+                + "JOIN DEPARTMENTS d ON e.dept_id = d.dept_id "
+                + "JOIN JOB_GRADES jg ON e.job_id = jg.job_id "
+                + "ORDER BY e.last_name, e.first_name "
+                + "FETCH FIRST ? ROWS ONLY";
+
+        String salarySql = "SELECT sh.salary AS \"currentSalary\" "
+                + "FROM SALARY_HISTORY sh "
+                + "WHERE sh.emp_id = ? "
+                + "ORDER BY sh.effective_date DESC "
+                + "FETCH FIRST 1 ROW ONLY";
+
+        String leaveSql = "SELECT "
+                + "       SUM(CASE WHEN lr.status = 'PENDING' THEN 1 ELSE 0 END) AS \"pendingLeaves\", "
+                + "       SUM(CASE WHEN lr.status = 'APPROVED' THEN 1 ELSE 0 END) AS \"approvedLeaves\", "
+                + "       SUM(CASE WHEN lr.status = 'DENIED' THEN 1 ELSE 0 END) AS \"deniedLeaves\" "
+                + "FROM LEAVE_REQUESTS lr "
+                + "WHERE lr.emp_id = ?";
+
+        String reviewSql = "SELECT ROUND(AVG(pr.score), 2) AS \"avgReviewScore\", "
+                + "       MAX(pr.review_year) AS \"latestReviewYear\" "
+                + "FROM PERFORMANCE_REVIEWS pr "
+                + "WHERE pr.emp_id = ?";
+
+        List<Map<String, Object>> employees = jdbcTemplate.queryForList(employeeSql, boundedLimit);
+
+        // Intentional N+1 demo: one employee query, then three detail lookups per row.
+        List<Map<String, Object>> rows = employees.stream().map(employee -> {
+            Object empId = employee.get("empId");
+            Map<String, Object> result = new LinkedHashMap<>(employee);
+
+            List<Map<String, Object>> salaryRows = jdbcTemplate.queryForList(salarySql, empId);
+            result.put("currentSalary", salaryRows.isEmpty() ? null : salaryRows.get(0).get("currentSalary"));
+
+            Map<String, Object> leaveSummary = jdbcTemplate.queryForMap(leaveSql, empId);
+            result.put("pendingLeaves", defaultZero(leaveSummary.get("pendingLeaves")));
+            result.put("approvedLeaves", defaultZero(leaveSummary.get("approvedLeaves")));
+            result.put("deniedLeaves", defaultZero(leaveSummary.get("deniedLeaves")));
+
+            Map<String, Object> reviewSummary = jdbcTemplate.queryForMap(reviewSql, empId);
+            result.put("avgReviewScore", reviewSummary.get("avgReviewScore"));
+            result.put("latestReviewYear", reviewSummary.get("latestReviewYear"));
+
+            return result;
+        }).toList();
+
+        return rows;
+    }
+
+    private List<Map<String, Object>> employeeDetailAuditEager(int boundedLimit) {
+        String sql = "WITH target_employees AS ( "
+                + "  SELECT emp_id, full_name, dept_name, job_title, employee_order "
+                + "  FROM ( "
+                + "    SELECT e.emp_id, "
+                + "           e.first_name || ' ' || e.last_name AS full_name, "
+                + "           d.dept_name, "
+                + "           jg.job_title, "
+                + "           ROW_NUMBER() OVER (ORDER BY e.last_name, e.first_name) AS employee_order "
+                + "    FROM EMPLOYEES e "
+                + "    JOIN DEPARTMENTS d ON e.dept_id = d.dept_id "
+                + "    JOIN JOB_GRADES jg ON e.job_id = jg.job_id "
+                + "  ) "
+                + "  WHERE employee_order <= ? "
+                + "), ranked_salaries AS ( "
+                + "  SELECT sh.emp_id, "
+                + "         sh.salary, "
+                + "         ROW_NUMBER() OVER (PARTITION BY sh.emp_id ORDER BY sh.effective_date DESC) AS rn "
+                + "  FROM SALARY_HISTORY sh "
+                + "  JOIN target_employees te ON te.emp_id = sh.emp_id "
+                + "), leave_summary AS ( "
+                + "  SELECT lr.emp_id, "
+                + "         SUM(CASE WHEN lr.status = 'PENDING' THEN 1 ELSE 0 END) AS pending_leaves, "
+                + "         SUM(CASE WHEN lr.status = 'APPROVED' THEN 1 ELSE 0 END) AS approved_leaves, "
+                + "         SUM(CASE WHEN lr.status = 'DENIED' THEN 1 ELSE 0 END) AS denied_leaves "
+                + "  FROM LEAVE_REQUESTS lr "
+                + "  JOIN target_employees te ON te.emp_id = lr.emp_id "
+                + "  GROUP BY lr.emp_id "
+                + "), review_summary AS ( "
+                + "  SELECT pr.emp_id, "
+                + "         ROUND(AVG(pr.score), 2) AS avg_review_score, "
+                + "         MAX(pr.review_year) AS latest_review_year "
+                + "  FROM PERFORMANCE_REVIEWS pr "
+                + "  JOIN target_employees te ON te.emp_id = pr.emp_id "
+                + "  GROUP BY pr.emp_id "
+                + ") "
+                + "SELECT te.emp_id AS \"empId\", "
+                + "       te.full_name AS \"fullName\", "
+                + "       te.dept_name AS \"deptName\", "
+                + "       te.job_title AS \"jobTitle\", "
+                + "       rs.salary AS \"currentSalary\", "
+                + "       NVL(ls.pending_leaves, 0) AS \"pendingLeaves\", "
+                + "       NVL(ls.approved_leaves, 0) AS \"approvedLeaves\", "
+                + "       NVL(ls.denied_leaves, 0) AS \"deniedLeaves\", "
+                + "       rv.avg_review_score AS \"avgReviewScore\", "
+                + "       rv.latest_review_year AS \"latestReviewYear\" "
+                + "FROM target_employees te "
+                + "LEFT JOIN ranked_salaries rs ON rs.emp_id = te.emp_id AND rs.rn = 1 "
+                + "LEFT JOIN leave_summary ls ON ls.emp_id = te.emp_id "
+                + "LEFT JOIN review_summary rv ON rv.emp_id = te.emp_id "
+                + "ORDER BY te.employee_order";
+
+        return jdbcTemplate.queryForList(sql, boundedLimit);
+    }
+
     @GetMapping("/leave-backlog")
     public ResponseEntity<List<Map<String, Object>>> leaveBacklog() {
         // Correlated subquery runs once per department — each fires a full scan of
@@ -144,5 +276,9 @@ public class ReportController {
                 + "FETCH FIRST 500 ROWS ONLY";
         List<Map<String, Object>> rows = jdbcTemplate.queryForList(sql);
         return ResponseEntity.ok(rows);
+    }
+
+    private Object defaultZero(Object value) {
+        return value == null ? 0 : value;
     }
 }
