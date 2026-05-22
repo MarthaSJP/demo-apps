@@ -3,28 +3,8 @@
 <%@ taglib prefix="fmt" uri="jakarta.tags.fmt" %>
 <%@ include file="header.jspf" %>
 
-<h1>Employee Detail Audit
-    <c:choose>
-        <c:when test="${strategy == 'eager'}">
-            <span class="page-badge">Eager Loaded</span>
-        </c:when>
-        <c:otherwise>
-            <span class="page-badge">N+1 Query Pattern</span>
-        </c:otherwise>
-    </c:choose>
-</h1>
+<h1>Employee Detail Audit <span class="page-badge">N+1 Query Pattern</span></h1>
 <p style="color:#666; margin-top:-8px;">Detailed employee audit view combining salary, leave, and performance summaries.</p>
-
-<form method="get" action="/reports/employee-detail-audit" class="search-row" style="max-width:420px;">
-    <button type="submit" name="strategy" value="nplus1"
-            <c:if test="${strategy != 'eager'}">style="background:#234b76;"</c:if>>
-        N+1 Pattern
-    </button>
-    <button type="submit" name="strategy" value="eager"
-            <c:if test="${strategy == 'eager'}">style="background:#234b76;"</c:if>>
-        Eager Loaded
-    </button>
-</form>
 
 <c:choose>
     <c:when test="${empty employeeAuditData}">

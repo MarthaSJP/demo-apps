@@ -56,8 +56,7 @@ All tables are seeded with 500k+ total rows and **no indexes on foreign-key colu
 | `GET /reports/performance` | 3-dimension `GROUP BY ROLLUP` | 150k review rows × 3-table JOIN; rollup on year + dept + role |
 | `GET /reports/leave-backlog` | Correlated subquery × 50 departments | Each department fires a full scan of 100k leave rows |
 | `GET /reports/salary-progression` | Full hash join 50k × 200k rows | Oracle must aggregate all salary rows before sorting top-500 |
-| `GET /reports/employee-detail-audit?strategy=nplus1` | Intentional N+1 detail lookups | Fetches employees once, then salary, leave, and review summaries per employee |
-| `GET /reports/employee-detail-audit?strategy=eager` | Eager-loaded audit detail | Loads the same salary, leave, and review summaries with aggregate joins |
+| `GET /reports/employee-detail-audit` | Intentional N+1 detail lookups | Fetches employees once, then salary, leave, and review summaries per employee |
 | `GET /leaves` | Multi-table JOIN + `TRUNC(end_date - start_date)` | Function on column prevents index seek; 100k leave rows |
 
 ---
@@ -188,17 +187,16 @@ http://localhost:8090
 | `/reports/performance` | 3-dimension ROLLUP across 150k review rows |
 | `/reports/leave-backlog` | **Slow** — correlated subquery per department, full scans |
 | `/reports/salary-progression` | **Slow** — full 200k-row hash join before sort |
-| `/reports/employee-detail-audit` | **N+1 / Eager** — compare per-employee lookups with eager-loaded aggregate joins; load generators use `strategy=eager` by default |
+| `/reports/employee-detail-audit` | **N+1** — fetches employee rows, then performs per-employee salary, leave, and review lookups |
 | `/leaves` | Leave requests — filter by status |
 
-The Selenium loadgen drives all UI paths automatically. For Employee Detail Audit, automated traffic uses `strategy=eager` by default so the steady-state load represents the N+1 fix. The API loadgen also drives backend endpoints directly so DB pressure can be tuned without browser overhead. You can still compare both strategies manually:
+The Selenium loadgen drives all UI paths automatically. The API loadgen also drives backend endpoints directly so DB pressure can be tuned without browser overhead. Employee Detail Audit intentionally keeps the N+1 query pattern enabled so New Relic can surface repeated per-employee SQL calls.
 
 ```bash
 curl "http://localhost:8080/api/reports/payroll?limit=100"
 curl "http://localhost:8080/api/reports/leave-backlog"
 curl "http://localhost:8080/api/reports/salary-progression"
-curl "http://localhost:8080/api/reports/employee-detail-audit?limit=5&strategy=nplus1"
-curl "http://localhost:8080/api/reports/employee-detail-audit?limit=5&strategy=eager"
+curl "http://localhost:8080/api/reports/employee-detail-audit?limit=5"
 curl "http://localhost:8080/api/employees?search=smith&size=20"
 ```
 
@@ -223,12 +221,10 @@ curl "http://localhost:8080/api/employees?search=smith&size=20"
 | `INTERNAL_TELEMETRY_METRICS_LEVEL` | `normal` | NRDOT self-monitoring verbosity: `normal` \| `detailed` \| `none` |
 | `LOADGEN_USERS` | `2` | Concurrent Selenium user threads |
 | `LOADGEN_INTERVAL` | `8` | Seconds between journeys per user (±2 s jitter) |
-| `LOADGEN_EMPLOYEE_AUDIT_STRATEGY` | `eager` | Strategy used when Selenium visits `/reports/employee-detail-audit`; set `nplus1` for comparison traffic |
 | `API_LOADGEN_WORKERS` | `4` | Concurrent direct-backend API worker threads |
 | `API_LOADGEN_INTERVAL` | `2` | Seconds between API calls per worker |
 | `API_LOADGEN_TIMEOUT` | `120` | Per-request timeout for slow report endpoints |
 | `API_LOADGEN_NPLUSONE_LIMIT` | `200` | Employee row count for the N+1 audit endpoint |
-| `API_LOADGEN_AUDIT_STRATEGY` | `eager` | Strategy used by API loadgen for `/api/reports/employee-detail-audit`; set `nplus1` to reintroduce N+1 load |
 | `API_LOADGEN_PAYROLL_LIMIT` | `300` | Row limit for the payroll endpoint |
 | `API_LOADGEN_NPLUSONE_WEIGHT` | `50` | Selection weight for `/api/reports/employee-detail-audit` |
 | `API_LOADGEN_PAYROLL_WEIGHT` | `15` | Selection weight for `/api/reports/payroll` |
@@ -246,13 +242,12 @@ docker compose up -d --build api-loadgen
 docker compose logs -f api-loadgen
 ```
 
-For heavier Employee Detail Audit traffic, raise workers or the audit weight. Automated traffic uses the eager-loaded implementation by default; set `API_LOADGEN_AUDIT_STRATEGY=nplus1` only when you want to reproduce the original N+1 pattern:
+For heavier Employee Detail Audit traffic, raise workers or the audit weight:
 
 ```env
 API_LOADGEN_WORKERS=8
 API_LOADGEN_INTERVAL=1
 API_LOADGEN_NPLUSONE_WEIGHT=80
-API_LOADGEN_AUDIT_STRATEGY=eager
 ```
 
 Employee Detail Audit requests add New Relic custom attributes to the frontend
@@ -260,9 +255,8 @@ and backend APM transactions:
 
 | Attribute | Values |
 |---|---|
-| `employeeAudit.strategy` | `nplus1` or `eager` |
+| `employeeAudit.queryPattern` | `nplus1` |
 | `employeeAudit.limit` | Requested employee row limit |
-| `employeeAudit.eagerLoaded` | `true` when eager loading is selected |
 
 ---
 

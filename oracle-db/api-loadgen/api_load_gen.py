@@ -35,10 +35,6 @@ TIMEOUT = float(os.getenv("API_LOADGEN_TIMEOUT", "120"))
 NPLUSONE_LIMIT = int(os.getenv("API_LOADGEN_NPLUSONE_LIMIT", "200"))
 PAYROLL_LIMIT = int(os.getenv("API_LOADGEN_PAYROLL_LIMIT", "300"))
 JITTER = float(os.getenv("API_LOADGEN_JITTER", "0.75"))
-AUDIT_STRATEGY = os.getenv("API_LOADGEN_AUDIT_STRATEGY", "eager").strip().lower()
-if AUDIT_STRATEGY not in ("nplus1", "eager"):
-    logger.warning("Invalid API_LOADGEN_AUDIT_STRATEGY=%s; using eager", AUDIT_STRATEGY)
-    AUDIT_STRATEGY = "eager"
 
 NPLUSONE_WEIGHT = int(os.getenv("API_LOADGEN_NPLUSONE_WEIGHT", "50"))
 PAYROLL_WEIGHT = int(os.getenv("API_LOADGEN_PAYROLL_WEIGHT", "15"))
@@ -60,8 +56,8 @@ class Endpoint:
 def endpoints() -> List[Endpoint]:
     return [
         Endpoint(
-            f"employee_detail_audit_{AUDIT_STRATEGY}",
-            f"/api/reports/employee-detail-audit?limit={NPLUSONE_LIMIT}&strategy={AUDIT_STRATEGY}",
+            "employee_detail_audit_nplusone",
+            f"/api/reports/employee-detail-audit?limit={NPLUSONE_LIMIT}",
             NPLUSONE_WEIGHT,
         ),
         Endpoint("payroll", f"/api/reports/payroll?limit={PAYROLL_LIMIT}", PAYROLL_WEIGHT),

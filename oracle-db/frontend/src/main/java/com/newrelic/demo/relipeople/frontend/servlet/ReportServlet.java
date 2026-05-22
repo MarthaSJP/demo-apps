@@ -16,8 +16,6 @@ import org.apache.hc.core5.http.io.entity.EntityUtils;
 import org.apache.hc.core5.util.Timeout;
 
 import java.io.IOException;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -71,18 +69,11 @@ public class ReportServlet extends HttpServlet {
                 jspPath = "/jsp/salary-progression-report.jsp";
                 break;
             case "/reports/employee-detail-audit":
-                String strategy = request.getParameter("strategy");
-                if (!"eager".equals(strategy)) {
-                    strategy = "nplus1";
-                }
-                NewRelic.addCustomParameter("employeeAudit.strategy", strategy);
                 NewRelic.addCustomParameter("employeeAudit.limit", 75);
-                NewRelic.addCustomParameter("employeeAudit.eagerLoaded", "eager".equals(strategy));
-                endpoint = "/api/reports/employee-detail-audit?limit=75&strategy="
-                        + URLEncoder.encode(strategy, StandardCharsets.UTF_8);
+                NewRelic.addCustomParameter("employeeAudit.queryPattern", "nplus1");
+                endpoint = "/api/reports/employee-detail-audit?limit=75";
                 attrName = "employeeAuditData";
                 jspPath = "/jsp/employee-detail-audit-report.jsp";
-                request.setAttribute("strategy", strategy);
                 break;
             default:
                 response.sendError(HttpServletResponse.SC_NOT_FOUND);
