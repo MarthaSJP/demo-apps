@@ -56,6 +56,12 @@
             <artifactId>jackson-databind</artifactId>
             <version>2.16.1</version>
         </dependency>
+
+        <dependency>
+            <groupId>com.newrelic.agent.java</groupId>
+            <artifactId>newrelic-api</artifactId>
+            <version>9.2.0</version>
+        </dependency>
     </dependencies>
 
     <build>
