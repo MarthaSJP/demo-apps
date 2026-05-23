@@ -10,9 +10,12 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/reports")
@@ -103,15 +106,182 @@ public class ReportController {
 
     @GetMapping("/employee-detail-audit")
     public ResponseEntity<List<Map<String, Object>>> employeeDetailAudit(
-            @RequestParam(name = "limit", required = false, defaultValue = "75") int limit) {
+            @RequestParam(name = "limit", required = false, defaultValue = "75") int limit,
+            @RequestParam(name = "strategy", required = false, defaultValue = "optimized") String strategy) {
         int boundedLimit = Math.max(1, Math.min(limit, 200));
 
         NewRelic.addCustomParameter("employeeAudit.limit", boundedLimit);
-        NewRelic.addCustomParameter("employeeAudit.queryPattern", "nplus1");
+        NewRelic.addCustomParameter("employeeAudit.queryPattern", strategy);
 
-        return ResponseEntity.ok(employeeDetailAuditNPlusOne(boundedLimit));
+        // デモ用に元のN+1パターンも残す（strategyパラメータで切り替え可能）
+        if ("nplus1".equalsIgnoreCase(strategy)) {
+            return ResponseEntity.ok(employeeDetailAuditNPlusOne(boundedLimit));
+        } else {
+            return ResponseEntity.ok(employeeDetailAuditOptimized(boundedLimit));
+        }
     }
 
+    /**
+     * 最適化版：IN句による一括取得でN+1問題を解消
+     * 
+     * 【修正内容】
+     * - 従業員IDリストを一括でIN句に渡して子テーブルを取得
+     * - 100件単位のチャンク処理でメモリ爆発とIN句の上限を回避
+     * - メモリ上でemp_idをキーにマッピング
+     * 
+     * 【パフォーマンス改善】
+     * - クエリ実行回数: (1 + 3N) → (1 + 3 * ceil(N/100))
+     * - 200件の場合: 601回 → 7回（約86倍の改善）
+     */
+    private List<Map<String, Object>> employeeDetailAuditOptimized(int boundedLimit) {
+        // 1. 親クエリ：従業員基本情報を取得
+        String employeeSql = "SELECT e.emp_id AS \"empId\", "
+                + "       e.first_name || ' ' || e.last_name AS \"fullName\", "
+                + "       d.dept_name AS \"deptName\", "
+                + "       jg.job_title AS \"jobTitle\" "
+                + "FROM EMPLOYEES e "
+                + "JOIN DEPARTMENTS d ON e.dept_id = d.dept_id "
+                + "JOIN JOB_GRADES jg ON e.job_id = jg.job_id "
+                + "ORDER BY e.last_name, e.first_name "
+                + "FETCH FIRST ? ROWS ONLY";
+
+        List<Map<String, Object>> employees = jdbcTemplate.queryForList(employeeSql, boundedLimit);
+
+        // 空チェック：従業員が0件の場合は即座に返却
+        if (employees.isEmpty()) {
+            return employees;
+        }
+
+        // 2. 従業員IDリストを抽出
+        List<Object> empIds = employees.stream()
+                .map(emp -> emp.get("empId"))
+                .collect(Collectors.toList());
+
+        // 3. チャンク処理用のヘルパー関数で100件ずつ分割して一括取得
+        Map<Object, Object> salaryMap = fetchSalariesInBulk(empIds);
+        Map<Object, Map<String, Object>> leaveMap = fetchLeaveSummariesInBulk(empIds);
+        Map<Object, Map<String, Object>> reviewMap = fetchReviewSummariesInBulk(empIds);
+
+        // 4. 従業員データに子データをマッピング
+        List<Map<String, Object>> result = employees.stream().map(employee -> {
+            Object empId = employee.get("empId");
+            Map<String, Object> row = new LinkedHashMap<>(employee);
+
+            // 給与情報をマッピング
+            row.put("currentSalary", salaryMap.get(empId));
+
+            // 休暇情報をマッピング（デフォルト値0を設定）
+            Map<String, Object> leaveSummary = leaveMap.getOrDefault(empId, new HashMap<>());
+            row.put("pendingLeaves", defaultZero(leaveSummary.get("pendingLeaves")));
+            row.put("approvedLeaves", defaultZero(leaveSummary.get("approvedLeaves")));
+            row.put("deniedLeaves", defaultZero(leaveSummary.get("deniedLeaves")));
+
+            // レビュー情報をマッピング
+            Map<String, Object> reviewSummary = reviewMap.getOrDefault(empId, new HashMap<>());
+            row.put("avgReviewScore", reviewSummary.get("avgReviewScore"));
+            row.put("latestReviewYear", reviewSummary.get("latestReviewYear"));
+
+            return row;
+        }).collect(Collectors.toList());
+
+        return result;
+    }
+
+    /**
+     * 給与情報を一括取得（100件ずつチャンク処理）
+     */
+    private Map<Object, Object> fetchSalariesInBulk(List<Object> empIds) {
+        Map<Object, Object> salaryMap = new HashMap<>();
+        
+        // 100件ずつチャンク処理
+        for (int i = 0; i < empIds.size(); i += 100) {
+            List<Object> chunk = empIds.subList(i, Math.min(i + 100, empIds.size()));
+            String placeholders = chunk.stream().map(id -> "?").collect(Collectors.joining(","));
+            
+            String sql = "SELECT sh.emp_id AS \"empId\", sh.salary AS \"currentSalary\" "
+                    + "FROM ( "
+                    + "  SELECT sh.emp_id, sh.salary, "
+                    + "         ROW_NUMBER() OVER (PARTITION BY sh.emp_id ORDER BY sh.effective_date DESC) AS rn "
+                    + "  FROM SALARY_HISTORY sh "
+                    + "  WHERE sh.emp_id IN (" + placeholders + ") "
+                    + ") sh "
+                    + "WHERE sh.rn = 1";
+
+            List<Map<String, Object>> salaries = jdbcTemplate.queryForList(sql, chunk.toArray());
+            for (Map<String, Object> row : salaries) {
+                salaryMap.put(row.get("empId"), row.get("currentSalary"));
+            }
+        }
+        
+        return salaryMap;
+    }
+
+    /**
+     * 休暇情報を一括取得（100件ずつチャンク処理）
+     */
+    private Map<Object, Map<String, Object>> fetchLeaveSummariesInBulk(List<Object> empIds) {
+        Map<Object, Map<String, Object>> leaveMap = new HashMap<>();
+        
+        // 100件ずつチャンク処理
+        for (int i = 0; i < empIds.size(); i += 100) {
+            List<Object> chunk = empIds.subList(i, Math.min(i + 100, empIds.size()));
+            String placeholders = chunk.stream().map(id -> "?").collect(Collectors.joining(","));
+            
+            String sql = "SELECT lr.emp_id AS \"empId\", "
+                    + "       SUM(CASE WHEN lr.status = 'PENDING' THEN 1 ELSE 0 END) AS \"pendingLeaves\", "
+                    + "       SUM(CASE WHEN lr.status = 'APPROVED' THEN 1 ELSE 0 END) AS \"approvedLeaves\", "
+                    + "       SUM(CASE WHEN lr.status = 'DENIED' THEN 1 ELSE 0 END) AS \"deniedLeaves\" "
+                    + "FROM LEAVE_REQUESTS lr "
+                    + "WHERE lr.emp_id IN (" + placeholders + ") "
+                    + "GROUP BY lr.emp_id";
+
+            List<Map<String, Object>> leaves = jdbcTemplate.queryForList(sql, chunk.toArray());
+            for (Map<String, Object> row : leaves) {
+                Map<String, Object> summary = new HashMap<>();
+                summary.put("pendingLeaves", row.get("pendingLeaves"));
+                summary.put("approvedLeaves", row.get("approvedLeaves"));
+                summary.put("deniedLeaves", row.get("deniedLeaves"));
+                leaveMap.put(row.get("empId"), summary);
+            }
+        }
+        
+        return leaveMap;
+    }
+
+    /**
+     * レビュー情報を一括取得（100件ずつチャンク処理）
+     */
+    private Map<Object, Map<String, Object>> fetchReviewSummariesInBulk(List<Object> empIds) {
+        Map<Object, Map<String, Object>> reviewMap = new HashMap<>();
+        
+        // 100件ずつチャンク処理
+        for (int i = 0; i < empIds.size(); i += 100) {
+            List<Object> chunk = empIds.subList(i, Math.min(i + 100, empIds.size()));
+            String placeholders = chunk.stream().map(id -> "?").collect(Collectors.joining(","));
+            
+            String sql = "SELECT pr.emp_id AS \"empId\", "
+                    + "       ROUND(AVG(pr.score), 2) AS \"avgReviewScore\", "
+                    + "       MAX(pr.review_year) AS \"latestReviewYear\" "
+                    + "FROM PERFORMANCE_REVIEWS pr "
+                    + "WHERE pr.emp_id IN (" + placeholders + ") "
+                    + "GROUP BY pr.emp_id";
+
+            List<Map<String, Object>> reviews = jdbcTemplate.queryForList(sql, chunk.toArray());
+            for (Map<String, Object> row : reviews) {
+                Map<String, Object> summary = new HashMap<>();
+                summary.put("avgReviewScore", row.get("avgReviewScore"));
+                summary.put("latestReviewYear", row.get("latestReviewYear"));
+                reviewMap.put(row.get("empId"), summary);
+            }
+        }
+        
+        return reviewMap;
+    }
+
+    /**
+     * 元のN+1パターン（デモ・比較用に保持）
+     * strategy=nplus1 パラメータで明示的に指定した場合のみ実行
+     */
     private List<Map<String, Object>> employeeDetailAuditNPlusOne(int boundedLimit) {
         String employeeSql = "SELECT e.emp_id AS \"empId\", "
                 + "       e.first_name || ' ' || e.last_name AS \"fullName\", "
