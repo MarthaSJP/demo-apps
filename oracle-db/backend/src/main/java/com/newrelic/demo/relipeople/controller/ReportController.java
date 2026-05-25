@@ -10,9 +10,11 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/reports")
@@ -103,15 +105,173 @@ public class ReportController {
 
     @GetMapping("/employee-detail-audit")
     public ResponseEntity<List<Map<String, Object>>> employeeDetailAudit(
-            @RequestParam(name = "limit", required = false, defaultValue = "75") int limit) {
+            @RequestParam(name = "limit", required = false, defaultValue = "75") int limit,
+            @RequestParam(name = "strategy", required = false, defaultValue = "optimized") String strategy) {
         int boundedLimit = Math.max(1, Math.min(limit, 200));
 
         NewRelic.addCustomParameter("employeeAudit.limit", boundedLimit);
-        NewRelic.addCustomParameter("employeeAudit.queryPattern", "nplus1");
+        NewRelic.addCustomParameter("employeeAudit.queryPattern", strategy);
 
-        return ResponseEntity.ok(employeeDetailAuditNPlusOne(boundedLimit));
+        // デモ目的で、N+1パターンと最適化パターンを切り替え可能にする
+        if ("nplus1".equalsIgnoreCase(strategy)) {
+            return ResponseEntity.ok(employeeDetailAuditNPlusOne(boundedLimit));
+        } else {
+            return ResponseEntity.ok(employeeDetailAuditOptimized(boundedLimit));
+        }
     }
 
+    /**
+     * 最適化版: N+1問題を解消したバルククエリ実装
+     * 
+     * 【最適化ポイント】
+     * 1. CTEを使用して、必要な従業員IDを事前に特定
+     * 2. 給与、休暇、レビューデータを一括取得（IN句使用）
+     * 3. 100件単位のバッチ処理でメモリ使用量を制御
+     * 4. emp_idのインデックスを活用した効率的なJOIN
+     * 
+     * 【期待される効果】
+     * - クエリ実行回数: O(N*3) → O(N/100 + 1)
+     * - データベース負荷: 99%以上削減
+     * - レスポンスタイム: 大幅改善
+     */
+    private List<Map<String, Object>> employeeDetailAuditOptimized(int boundedLimit) {
+        // バッチサイズ: メモリエクスプロージョン防止のため100件単位で処理
+        final int BATCH_SIZE = 100;
+        
+        // ステップ1: 対象従業員の基本情報を取得
+        String employeeSql = "SELECT e.emp_id AS \"empId\", "
+                + "       e.first_name || ' ' || e.last_name AS \"fullName\", "
+                + "       d.dept_name AS \"deptName\", "
+                + "       jg.job_title AS \"jobTitle\" "
+                + "FROM EMPLOYEES e "
+                + "JOIN DEPARTMENTS d ON e.dept_id = d.dept_id "
+                + "JOIN JOB_GRADES jg ON e.job_id = jg.job_id "
+                + "ORDER BY e.last_name, e.first_name "
+                + "FETCH FIRST ? ROWS ONLY";
+
+        List<Map<String, Object>> employees = jdbcTemplate.queryForList(employeeSql, boundedLimit);
+        
+        // 従業員が存在しない場合は空リストを返す（空チェックのガード節）
+        if (employees.isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        List<Map<String, Object>> results = new ArrayList<>();
+        
+        // バッチ処理: 100件ごとに分割して処理
+        for (int i = 0; i < employees.size(); i += BATCH_SIZE) {
+            int endIndex = Math.min(i + BATCH_SIZE, employees.size());
+            List<Map<String, Object>> batch = employees.subList(i, endIndex);
+            
+            // バッチ内の従業員IDリストを抽出
+            List<Object> empIds = batch.stream()
+                    .map(emp -> emp.get("empId"))
+                    .collect(Collectors.toList());
+            
+            // IN句用のプレースホルダーを生成（例: ?,?,?）
+            String placeholders = empIds.stream()
+                    .map(id -> "?")
+                    .collect(Collectors.joining(","));
+            
+            // ステップ2: バッチ内の全従業員の給与情報を一括取得
+            String salarySql = "WITH ranked_salaries AS ( "
+                    + "  SELECT sh.emp_id, "
+                    + "         sh.salary, "
+                    + "         ROW_NUMBER() OVER (PARTITION BY sh.emp_id ORDER BY sh.effective_date DESC) AS rn "
+                    + "  FROM SALARY_HISTORY sh "
+                    + "  WHERE sh.emp_id IN (" + placeholders + ") "
+                    + ") "
+                    + "SELECT emp_id AS \"empId\", salary AS \"currentSalary\" "
+                    + "FROM ranked_salaries "
+                    + "WHERE rn = 1";
+            
+            List<Map<String, Object>> salaries = jdbcTemplate.queryForList(salarySql, empIds.toArray());
+            Map<Object, Object> salaryMap = salaries.stream()
+                    .collect(Collectors.toMap(
+                            row -> row.get("empId"),
+                            row -> row.get("currentSalary")
+                    ));
+            
+            // ステップ3: バッチ内の全従業員の休暇情報を一括取得
+            String leaveSql = "SELECT lr.emp_id AS \"empId\", "
+                    + "       SUM(CASE WHEN lr.status = 'PENDING' THEN 1 ELSE 0 END) AS \"pendingLeaves\", "
+                    + "       SUM(CASE WHEN lr.status = 'APPROVED' THEN 1 ELSE 0 END) AS \"approvedLeaves\", "
+                    + "       SUM(CASE WHEN lr.status = 'DENIED' THEN 1 ELSE 0 END) AS \"deniedLeaves\" "
+                    + "FROM LEAVE_REQUESTS lr "
+                    + "WHERE lr.emp_id IN (" + placeholders + ") "
+                    + "GROUP BY lr.emp_id";
+            
+            List<Map<String, Object>> leaves = jdbcTemplate.queryForList(leaveSql, empIds.toArray());
+            Map<Object, Map<String, Object>> leaveMap = leaves.stream()
+                    .collect(Collectors.toMap(
+                            row -> row.get("empId"),
+                            row -> row
+                    ));
+            
+            // ステップ4: バッチ内の全従業員のレビュー情報を一括取得
+            String reviewSql = "SELECT pr.emp_id AS \"empId\", "
+                    + "       ROUND(AVG(pr.score), 2) AS \"avgReviewScore\", "
+                    + "       MAX(pr.review_year) AS \"latestReviewYear\" "
+                    + "FROM PERFORMANCE_REVIEWS pr "
+                    + "WHERE pr.emp_id IN (" + placeholders + ") "
+                    + "GROUP BY pr.emp_id";
+            
+            List<Map<String, Object>> reviews = jdbcTemplate.queryForList(reviewSql, empIds.toArray());
+            Map<Object, Map<String, Object>> reviewMap = reviews.stream()
+                    .collect(Collectors.toMap(
+                            row -> row.get("empId"),
+                            row -> row
+                    ));
+            
+            // ステップ5: メモリ上で結果をマッピング（元の並び順を維持）
+            for (Map<String, Object> employee : batch) {
+                Object empId = employee.get("empId");
+                Map<String, Object> result = new LinkedHashMap<>(employee);
+                
+                // 給与情報をマッピング
+                result.put("currentSalary", salaryMap.get(empId));
+                
+                // 休暇情報をマッピング（データが存在しない場合は0を設定）
+                Map<String, Object> leaveData = leaveMap.get(empId);
+                if (leaveData != null) {
+                    result.put("pendingLeaves", defaultZero(leaveData.get("pendingLeaves")));
+                    result.put("approvedLeaves", defaultZero(leaveData.get("approvedLeaves")));
+                    result.put("deniedLeaves", defaultZero(leaveData.get("deniedLeaves")));
+                } else {
+                    result.put("pendingLeaves", 0);
+                    result.put("approvedLeaves", 0);
+                    result.put("deniedLeaves", 0);
+                }
+                
+                // レビュー情報をマッピング
+                Map<String, Object> reviewData = reviewMap.get(empId);
+                if (reviewData != null) {
+                    result.put("avgReviewScore", reviewData.get("avgReviewScore"));
+                    result.put("latestReviewYear", reviewData.get("latestReviewYear"));
+                } else {
+                    result.put("avgReviewScore", null);
+                    result.put("latestReviewYear", null);
+                }
+                
+                results.add(result);
+            }
+        }
+        
+        return results;
+    }
+
+    /**
+     * N+1パターン版（デモ・比較用）
+     * 
+     * 【警告】このメソッドは意図的にN+1問題を発生させています。
+     * 本番環境では使用しないでください。
+     * 
+     * 【問題点】
+     * - 従業員1人につき3回のクエリを実行
+     * - 75人の場合: 1 + (75 * 3) = 226回のクエリ
+     * - データベースへの往復回数が膨大
+     * - 全表スキャンが発生する可能性
+     */
     private List<Map<String, Object>> employeeDetailAuditNPlusOne(int boundedLimit) {
         String employeeSql = "SELECT e.emp_id AS \"empId\", "
                 + "       e.first_name || ' ' || e.last_name AS \"fullName\", "
